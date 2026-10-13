@@ -1,6 +1,6 @@
 {
   "name": "deckygram",
-  "version": "0.25.1",
+  "version": "0.25.2",
   "description": "Telegram chat and reply client for SteamOS",
   "type": "module",
   "scripts": {

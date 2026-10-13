@@ -1189,7 +1189,7 @@ type MessageResult = {
 
 // Kept equal to package.json by tests; comparing it with the backend's version shows when Steam is
 // still running an older panel after an update.
-const PANEL_VERSION = "0.25.1";
+const PANEL_VERSION = "0.25.2";
 
 const getState = callable<[], TelegramState>("get_state");
 const getVersion = callable<[], string>("get_version");
@@ -2642,6 +2642,9 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleDraftKeyDown}
+                    // Starting on the message box keeps the list at the newest messages; focusing a message
+                    // first would scroll the list up to wherever that message sits.
+                    focusOnMount
                   />
                 </div>
                 <Focusable className="sg-chat-actions" flow-children="row">
