@@ -27,6 +27,7 @@ import {
   FaCheckDouble,
   FaBell,
   FaBellSlash,
+  FaArrowCircleUp,
   FaCog,
   FaExclamationCircle,
   FaExpand,
@@ -956,6 +957,27 @@ const styleText = `
   color: #ff5c5c;
 }
 
+.sg-update-dot {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff5c5c;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.4);
+}
+
+.sg-update-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sg-password input {
+  -webkit-text-security: disc;
+}
+
 .sg-message-hint {
   font-size: 12px;
   opacity: 0.7;
@@ -1167,10 +1189,30 @@ type MessageResult = {
 
 // Kept equal to package.json by tests; comparing it with the backend's version shows when Steam is
 // still running an older panel after an update.
-const PANEL_VERSION = "0.24.2";
+const PANEL_VERSION = "0.25.1";
 
 const getState = callable<[], TelegramState>("get_state");
 const getVersion = callable<[], string>("get_version");
+type UpdateStatus = {
+  current: string;
+  latest: string;
+  update_available: boolean;
+  download_url: string;
+  sha256: string;
+  release_url: string;
+  checked_at: number;
+  error: string;
+};
+const getUpdateStatus = callable<[], UpdateStatus | null>("get_update_status");
+const checkForUpdate = callable<[], UpdateStatus>("check_for_update");
+// Decky's own installer, the one its plugin store uses: it asks the user to confirm, downloads the ZIP,
+// checks it against the release's SHA-256 when GitHub provides one, and reloads the plugin.
+const DECKY_INSTALL_TYPE_UPDATE = 2;
+function installUpdate(status: UpdateStatus) {
+  const install = (window as any).DeckyBackend?.callable?.("utilities/install_plugin");
+  if (!install) throw new Error("Decky's installer is not available");
+  return install(status.download_url, "Deckygram", status.latest, status.sha256 || null, DECKY_INSTALL_TYPE_UPDATE);
+}
 const getChats = callable<[], Chat[]>("get_chats");
 const getMessages = callable<[chatId: number], MessageResult>("get_messages");
 const selectChat = callable<[chatId: number], TelegramState>("open_chat");
@@ -1606,6 +1648,8 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
   const [showSettings, setShowSettings] = useState(false);
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [backendVersion, setBackendVersion] = useState("");
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [updateState, setUpdateState] = useState<"idle" | "checking" | "installing">("idle");
   const [typingText, setTypingText] = useState("");
   // Images are fetched once per message and kept here, instead of travelling with every 2-second refresh.
   const imageCache = useRef(new Map<string, string>());
@@ -1647,6 +1691,35 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
   useEffect(() => {
     getVersion().then(setBackendVersion).catch(() => setBackendVersion(""));
   }, []);
+
+  useEffect(() => {
+    // The backend checks GitHub in the background; this only reads its last result.
+    getUpdateStatus().then(setUpdateStatus).catch(() => undefined);
+  }, []);
+
+  const pressUpdateButton = async () => {
+    if (updateState !== "idle") return;
+    if (updateStatus?.update_available) {
+      setUpdateState("installing");
+      setNotice(t("updateStarted"));
+      try {
+        await installUpdate(updateStatus);
+      } catch (error) {
+        setNotice((error as Error).message);
+      } finally {
+        setUpdateState("idle");
+      }
+      return;
+    }
+    setUpdateState("checking");
+    try {
+      setUpdateStatus(await checkForUpdate());
+    } catch (error) {
+      setNotice((error as Error).message);
+    } finally {
+      setUpdateState("idle");
+    }
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -2273,6 +2346,25 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
                 )}
                 {notice ? <PanelSectionRow>{notice}</PanelSectionRow> : null}
               </PanelSection>
+              <PanelSection title={t("updates")}>
+                <PanelSectionRow>
+                  <ButtonItem
+                    layout="below"
+                    onClick={() => void pressUpdateButton()}
+                    disabled={updateState !== "idle"}
+                    description={updateStatus?.error && !updateStatus.update_available
+                      ? t("updateCheckFailed", { error: updateStatus.error })
+                      : t("installedVersion", { version: PANEL_VERSION })}
+                  >
+                    <span className="sg-update-button">
+                      {updateState === "checking" ? t("checkingVersion")
+                        : updateStatus?.update_available ? <><FaArrowCircleUp /> {t("updateTo", { version: updateStatus.latest })}</>
+                          : updateStatus && !updateStatus.error ? <><FaCheck /> {t("upToDate")}</>
+                            : t("checkVersion")}
+                    </span>
+                  </ButtonItem>
+                </PanelSectionRow>
+              </PanelSection>
               <PanelSection>
                 <PanelSectionRow>
                   <div className="sg-settings-note sg-version">
@@ -2609,8 +2701,15 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
                 <DialogButton className="sg-icon-button" onClick={refreshChatList} disabled={busy} style={iconButtonStyle}>
                   <FaSyncAlt />
                 </DialogButton>
-                <DialogButton className="sg-icon-button" onClick={() => setShowSettings(true)} disabled={busy} style={iconButtonStyle}>
+                <DialogButton
+                  className="sg-icon-button"
+                  onClick={() => setShowSettings(true)}
+                  disabled={busy}
+                  onOKActionDescription={updateStatus?.update_available ? t("updateAvailable") : undefined}
+                  style={{ ...iconButtonStyle, position: "relative" }}
+                >
                   <FaCog />
+                  {updateStatus?.update_available ? <span className="sg-update-dot" /> : null}
                 </DialogButton>
               </Focusable>
               {visibleChats.map((chat, position) => (
@@ -2722,14 +2821,18 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
             {state.status === "password" ? (
               <>
                 <PanelSectionRow>
-                  <TextField
-                    label={t("cloudPassword")}
-                    value={cloudPassword}
-                    onChange={(event) => setCloudPassword(event.target.value)}
-                    onKeyDown={handlePasswordKeyDown}
-                    bIsPassword
-                    disabled={busy}
-                  />
+                  {/* bIsPassword alone shows the text on this Steam build; the class masks it with CSS either way. */}
+                  <div className="sg-password">
+                    <TextField
+                      {...{ type: "password", autoComplete: "off" }}
+                      label={t("cloudPassword")}
+                      value={cloudPassword}
+                      onChange={(event) => setCloudPassword(event.target.value)}
+                      onKeyDown={handlePasswordKeyDown}
+                      bIsPassword
+                      disabled={busy}
+                    />
+                  </div>
                 </PanelSectionRow>
                 <PanelSectionRow>
                   <ButtonItem onClick={() => void submitPassword()} disabled={busy || !cloudPassword.trim()}>

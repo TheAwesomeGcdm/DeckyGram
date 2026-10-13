@@ -9,7 +9,8 @@ import decky
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from screenshots import list_screenshots, read_screenshot
-from telegram_web_bridge import TelegramWebBridge, stop_stale_electron_processes
+from telegram_web_bridge import TelegramWebBridge, _ssl_contexts, stop_stale_electron_processes
+from updates import check_for_update as check_latest_release
 
 # Deckygram was called SteamGram; its Telegram login, Electron runtime and settings live under that name.
 LEGACY_PLUGIN_NAME = "SteamGram"
@@ -29,9 +30,12 @@ SETTING_CHOICES = {
     "unread_badges": {"all", "dms", "off"},
     "cooldown_minutes": {3, 5, 10, 15},
 }
-# A chat that raised this many popups within the cooldown window stays quiet until the oldest ages out;
-# its unread badge keeps counting either way.
+# A chat that raised this many popups stays quiet until the cooldown window has passed since the first
+# of them, then starts over; its unread badge keeps counting either way.
 COOLDOWN_NOTIFICATION_LIMIT = 3
+# The first update check waits for Deckygram to settle after Steam starts, then repeats a few times a day.
+UPDATE_FIRST_CHECK_SECONDS = 60
+UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 
 
 def valid_setting(key, value):
@@ -44,8 +48,13 @@ def valid_setting(key, value):
 
 
 def allow_notification(sent_at: list[float], now: float, window_seconds: float, limit: int) -> bool:
-    """Drops popups older than the window from sent_at and records this one if the chat is under the limit."""
-    sent_at[:] = [moment for moment in sent_at if now - moment < window_seconds]
+    """Records this popup in sent_at if the chat's current burst is under the limit.
+
+    A burst starts with a chat's first popup. Once the window has passed since then, the burst is over
+    and the count starts again from zero, so the next `limit` popups all show.
+    """
+    if sent_at and now - sent_at[0] >= window_seconds:
+        sent_at.clear()
     if len(sent_at) >= limit:
         return False
     sent_at.append(now)
@@ -61,6 +70,8 @@ class Plugin:
         self.settings_path = os.path.join(settings_dir, "settings.json")
         self.settings = self._load_settings()
         self.notification_task = None
+        self.update_task = None
+        self.update_status = None
         self.user_home = os.environ.get("DECKY_USER_HOME", decky.DECKY_USER_HOME)
 
     async def get_state(self):
@@ -146,6 +157,22 @@ class Plugin:
                 decky.logger.error("Unable to check Telegram notifications: %s", error)
             await asyncio.sleep(10)
 
+    async def get_update_status(self):
+        return self.update_status
+
+    async def check_for_update(self):
+        version = getattr(decky, "DECKY_PLUGIN_VERSION", "")
+        self.update_status = await asyncio.to_thread(check_latest_release, version, _ssl_contexts())
+        return self.update_status
+
+    async def _watch_updates(self):
+        await asyncio.sleep(UPDATE_FIRST_CHECK_SECONDS)
+        while True:
+            status = await self.check_for_update()
+            if status["error"]:
+                decky.logger.info("Deckygram update check failed: %s", status["error"])
+            await asyncio.sleep(UPDATE_CHECK_INTERVAL_SECONDS)
+
     async def get_messages(self, chat_id: int):
         return await self.telegram.get_messages(chat_id)
 
@@ -216,12 +243,15 @@ class Plugin:
     async def _main(self):
         await self.telegram.start()
         self.notification_task = asyncio.create_task(self._watch_notifications())
+        self.update_task = asyncio.create_task(self._watch_updates())
 
     async def _unload(self):
-        if self.notification_task:
-            self.notification_task.cancel()
+        for task in (self.notification_task, self.update_task):
+            if not task:
+                continue
+            task.cancel()
             try:
-                await self.notification_task
+                await task
             except asyncio.CancelledError:
                 pass
         await self.telegram.stop()

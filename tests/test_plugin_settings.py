@@ -267,11 +267,22 @@ def test_cooldown_off_notifies_every_message(monkeypatch):
     assert len(emitted) == 5
 
 
-def test_allow_notification_frees_up_once_the_window_passes(monkeypatch):
+def test_allow_notification_starts_over_once_the_window_passes_since_the_first_popup(monkeypatch):
     plugin_class = load_plugin_class(monkeypatch)
     allow = plugin_class._watch_notifications.__globals__["allow_notification"]
     sent_at = []
 
     assert [allow(sent_at, moment, 300, 3) for moment in (0, 10, 20, 30)] == [True, True, True, False]
+    # Silenced messages do not push the end of the burst back.
     assert allow(sent_at, 299, 300, 3) is False
-    assert allow(sent_at, 301, 300, 3) is True
+    # 5 minutes after the first popup, a whole new burst of three is allowed.
+    assert [allow(sent_at, moment, 300, 3) for moment in (300, 301, 302, 303)] == [True, True, True, False]
+
+
+def test_allow_notification_keeps_a_quiet_chat_unlimited(monkeypatch):
+    plugin_class = load_plugin_class(monkeypatch)
+    allow = plugin_class._watch_notifications.__globals__["allow_notification"]
+    sent_at = []
+
+    # Messages far enough apart each start a fresh burst.
+    assert [allow(sent_at, moment, 300, 3) for moment in (0, 400, 800, 1200, 1600)] == [True] * 5
