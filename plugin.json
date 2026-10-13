@@ -1,0 +1,11 @@
+{
+  "name": "Deckygram",
+  "author": "Deckygram",
+  "flags": ["debug"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["telegram", "messaging"],
+    "description": "Telegram Web chats and replies on Steam Deck.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}
