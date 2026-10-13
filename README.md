@@ -16,10 +16,9 @@ This is _heavily_ inspired by https://github.com/Necrosiak/Steamcord
 
 ## Installing
 
-1. Download **Deckygram.zip** from the assets below.
+1. Download **Deckygram.zip** from Releases.
 2. In Decky Loader's settings, turn on **Developer mode** if it isn't on already.
 3. In the **Developer** section, choose **Install plugin from ZIP file** and pick Deckygram.zip.
-4. Restart Steam once after installing, so the new panel loads.
 
 <!-- If you plan to submit Deckygram to the Decky plugin store later, this section can say so. -->
 
