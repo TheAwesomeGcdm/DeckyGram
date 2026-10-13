@@ -11,6 +11,7 @@ import {
   Focusable,
   GamepadButton,
   ModalRoot,
+  NavEntryPositionPreferences,
   PanelSection,
   PanelSectionRow,
   showModal,
@@ -1189,7 +1190,7 @@ type MessageResult = {
 
 // Kept equal to package.json by tests; comparing it with the backend's version shows when Steam is
 // still running an older panel after an update.
-const PANEL_VERSION = "0.25.2";
+const PANEL_VERSION = "0.25.3";
 
 const getState = callable<[], TelegramState>("get_state");
 const getVersion = callable<[], string>("get_version");
@@ -1637,6 +1638,10 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
   const [messageAction, setMessageAction] = useState<MessageAction | null>(null);
   const actionRowRef = useRef<HTMLDivElement>(null);
   const draftFieldRef = useRef<HTMLDivElement>(null);
+  // Steam's handle for the message box's controller-navigation node.
+  const draftNavRef = useRef<{ TakeFocus(): void } | undefined>(undefined);
+  const [draftFocusRequest, setDraftFocusRequest] = useState(0);
+  const focusDraft = () => setDraftFocusRequest((request) => request + 1);
   const [showStickers, setShowStickers] = useState(false);
   // Playing GIFs by message id, as object URLs; "" while a GIF is still loading.
   const gifUrls = useRef(new Map<number, string>());
@@ -1846,6 +1851,16 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
       observer?.disconnect();
     };
   });
+
+  useEffect(() => {
+    // Starting on the message box keeps the list at the newest messages; focusing a message first would
+    // scroll the list up to wherever that message sits. This runs after the commit, because when the
+    // focused control (the chat row, a sticker) unmounts, Steam clears its controller focus, and A then
+    // lands on the first button (the back arrow). Browser focus alone doesn't reach Steam's navigation.
+    if (!selectedChat) return;
+    if (draftNavRef.current) draftNavRef.current.TakeFocus();
+    else draftFieldRef.current?.querySelector("input")?.focus();
+  }, [selectedChat?.id, draftFocusRequest]);
 
   const isViewable = (message: Message) => Boolean(message.image) && IMAGE_LABELS.has(message.media);
   const isPlayable = (message: Message) => Boolean(message.image) && PLAYABLE_LABELS.has(message.media);
@@ -2082,7 +2097,7 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
       await sendMessage(selectedChat.id, draft, null);
       setDraft("");
       // Pressing Send moves focus to the button; return it so the conversation can go on.
-      draftFieldRef.current?.querySelector("input")?.focus();
+      focusDraft();
       await refreshMessages(selectedChat);
     } catch (error) {
       setNotice((error as Error).message);
@@ -2405,6 +2420,8 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
                 ref={scrollRef}
                 className="sg-chat-scroll"
                 flow-children="column"
+                // Moving into the list starts at the newest message, next to the message box, not the oldest.
+                navEntryPreferPosition={NavEntryPositionPreferences.LAST}
                 style={scrollHeight ? { height: scrollHeight } : { maxHeight: "52vh" }}
               >
                 <div className="sg-chat-stack">
@@ -2630,23 +2647,20 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
                   onSent={() => {
                     setShowStickers(false);
                     void refreshMessages(selectedChat);
-                    draftFieldRef.current?.querySelector("input")?.focus();
+                    focusDraft();
                   }}
                 />
               ) : null}
               <Focusable className="sg-chat-composer" flow-children="column">
                 {/* Never disabled: disabling a focused field drops focus, and the next message would need it reselected. */}
-                <div ref={draftFieldRef}>
+                <Focusable ref={draftFieldRef} {...{ navRef: draftNavRef }}>
                   <TextField
                     {...{ placeholder: t("message") }}
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleDraftKeyDown}
-                    // Starting on the message box keeps the list at the newest messages; focusing a message
-                    // first would scroll the list up to wherever that message sits.
-                    focusOnMount
                   />
-                </div>
+                </Focusable>
                 <Focusable className="sg-chat-actions" flow-children="row">
                   <DialogButton className="sg-chat-send" onClick={() => void sendDraft()} disabled={busy || !draft.trim()}>
                     {t("send")}
