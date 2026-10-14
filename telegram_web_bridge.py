@@ -26,7 +26,12 @@ ELECTRON_ARCHIVE = f"electron-v{ELECTRON_VERSION}-linux-x64.zip"
 ELECTRON_RELEASE = f"https://github.com/electron/electron/releases/download/v{ELECTRON_VERSION}"
 MAX_ELECTRON_ARCHIVE_BYTES = 300 * 1024 * 1024
 MAX_STARTUP_LOG_BYTES = 8 * 1024
-ELECTRON_STOP_TIMEOUT_SECONDS = 5
+ELECTRON_STOP_TIMEOUT_SECONDS = 10
+# Decky kills a plugin's backend five seconds after asking it to stop.
+UNLOAD_STOP_SECONDS = 3
+# At boot Decky starts plugins before Steam's compositor has opened its Wayland socket.
+DISPLAY_WAIT_SECONDS = 90
+DISPLAY_POLL_SECONDS = 2
 STEAMOS_CA_BUNDLE_PATHS = (
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
@@ -267,25 +272,50 @@ def find_stale_electron_process_groups(browser_dir: str, proc_dir: str = "/proc"
     return groups
 
 
-def stop_stale_electron_processes(browser_dir: str) -> int:
-    """Stop Electron instances left behind when an earlier Deckygram backend exited uncleanly."""
-    groups = find_stale_electron_process_groups(browser_dir)
-    for group in groups:
-        try:
-            os.killpg(group, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + ELECTRON_STOP_TIMEOUT_SECONDS
+def _wait_for_groups_to_exit(groups: set[int], timeout: float) -> set[int]:
+    """Wait until the process groups are empty; returns the groups still running at the deadline."""
+    deadline = time.monotonic() + timeout
     remaining = set(groups)
-    while remaining and time.monotonic() < deadline:
+    while remaining:
         for group in list(remaining):
             try:
                 os.killpg(group, 0)
             except ProcessLookupError:
                 remaining.discard(group)
-        if remaining:
-            time.sleep(0.1)
-    for group in remaining:
+        if not remaining or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    return remaining
+
+
+def _process_running(pid: int, proc_dir: str = "/proc") -> bool:
+    """True until the process has exited; an exited child waiting to be reaped counts as stopped."""
+    try:
+        with open(os.path.join(proc_dir, str(pid), "stat"), encoding="utf-8") as stat_file:
+            # The state follows the command name, which is in parentheses and may contain spaces.
+            return stat_file.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _request_electron_quit(group: int) -> None:
+    """Electron's main process leads its group; signalling it alone lets Chromium stop its helper processes,
+    including the one writing Telegram's storage, in order. Without a main process, the helpers are stopped."""
+    try:
+        os.kill(group, signal.SIGTERM)
+    except ProcessLookupError:
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def stop_stale_electron_processes(browser_dir: str) -> int:
+    """Stop Electron instances left behind when an earlier Deckygram backend exited uncleanly."""
+    groups = find_stale_electron_process_groups(browser_dir)
+    for group in groups:
+        _request_electron_quit(group)
+    for group in _wait_for_groups_to_exit(groups, ELECTRON_STOP_TIMEOUT_SECONDS):
         try:
             os.killpg(group, signal.SIGKILL)
         except ProcessLookupError:
@@ -294,26 +324,20 @@ def stop_stale_electron_processes(browser_dir: str) -> int:
 
 
 async def terminate_process_group(process: asyncio.subprocess.Process) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        await process.wait()
-        return
-
+    """Ask Electron to quit so Telegram's storage is written out, then clear whatever is left of its group."""
+    _request_electron_quit(process.pid)
     try:
         await asyncio.wait_for(process.wait(), timeout=ELECTRON_STOP_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.wait()
-        return
-
+        pass
+    else:
+        # Chromium's helpers finish shortly after the main process.
+        await asyncio.to_thread(_wait_for_groups_to_exit, {process.pid}, 2)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    await process.wait()
 
 
 def install_electron(runtime_dir: str) -> str:
@@ -382,8 +406,25 @@ class TelegramWebBridge:
             "qr_image": None,
         }
         self.lock = asyncio.Lock()
+        # One start at a time: a retry pressed while the first start waits must not launch a second Electron.
+        self.start_lock = asyncio.Lock()
 
     async def start(self) -> None:
+        async with self.start_lock:
+            await self._start()
+
+    async def _wait_for_display(self) -> dict[str, str] | None:
+        """Steam's Wayland environment once its socket exists, or None if there is none in time and no X display."""
+        deadline = asyncio.get_running_loop().time() + DISPLAY_WAIT_SECONDS
+        while True:
+            environment = discover_wayland_environment(os.environ.copy())
+            if environment or os.environ.get("DISPLAY"):
+                return environment
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(DISPLAY_POLL_SECONDS)
+
+    async def _start(self) -> None:
         if self.process and self.process.returncode is None:
             return
         os.makedirs(self.profile_dir, mode=0o700, exist_ok=True)
@@ -397,7 +438,7 @@ class TelegramWebBridge:
             )
             return
 
-        launch_environment = discover_wayland_environment(os.environ.copy())
+        launch_environment = await self._wait_for_display()
         if not launch_environment and not os.environ.get("DISPLAY"):
             await self._set_state(
                 status="error",
@@ -729,6 +770,21 @@ class TelegramWebBridge:
         if process:
             await terminate_process_group(process)
             self.process = None
+        self._release_profile_lock()
+        self.port = None
+        self.token = None
+
+    async def shut_down(self) -> None:
+        """For plugin unload, which Decky cuts off after five seconds: Telegram Web is asked to quit and given
+        a few seconds. Nothing here awaits the process object, whose watcher may belong to another event loop.
+        If Electron needs longer it finishes by itself, and the next start waits for it."""
+        process = self.process
+        self.process = None
+        if process:
+            _request_electron_quit(process.pid)
+            deadline = time.monotonic() + UNLOAD_STOP_SECONDS
+            while _process_running(process.pid) and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
         self._release_profile_lock()
         self.port = None
         self.token = None

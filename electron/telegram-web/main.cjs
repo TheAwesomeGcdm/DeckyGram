@@ -18,6 +18,10 @@ let ready = false;
 let pageLoadStartedAt = 0;
 let pageLoadedAt = 0;
 let initializationFailureLogged = false;
+// Telegram Web keeps an offline copy of itself and of the chats it last showed. If Electron was stopped
+// mid-write, that copy can be unreadable and the app fails before drawing anything, so it is cleared and the
+// page reloaded once per run.
+let appCacheResetTried = false;
 let currentChatId = null;
 let loadError = null;
 let cachedState = null;
@@ -677,6 +681,10 @@ async function collectTelegramState() {
         + `performanceResources=${page.performance_resource_count}, `
         + `documentUrl=${describeResourceUrl(window.webContents.getURL())}`,
       );
+    }
+    if (!appCacheResetTried) {
+      void reloadWithFreshAppCache();
+      return { status: "connecting", qr_image: null, chats: [] };
     }
     return {
       status: "error",
@@ -1633,6 +1641,35 @@ app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-features", "MediaRouter");
 app.setPath("userData", profileDir);
 
+// Clears Telegram's service worker, offline files and IndexedDB chat cache, which it downloads again. The login
+// lives in localStorage, which stays.
+async function reloadWithFreshAppCache() {
+  if (appCacheResetTried) return;
+  appCacheResetTried = true;
+  log("Clearing Telegram Web's offline app cache and reloading");
+  try {
+    await window.webContents.session.clearStorageData({
+      origin: "https://web.telegram.org",
+      storages: ["serviceworkers", "cachestorage", "indexdb"],
+    });
+  } catch (error) {
+    log(`Clearing Telegram Web's offline app cache failed: ${error.message}`);
+  }
+  window.webContents.reloadIgnoringCache();
+}
+
+// Telegram logs some startup errors as bare objects, which reach the console-message event as
+// "[object DOMException]"; spelling out their name and message keeps the log useful.
+const describeConsoleErrorsSource = `(() => {
+  if (window.__deckygramConsoleErrors) return;
+  window.__deckygramConsoleErrors = true;
+  const describe = (value) => (value instanceof DOMException || value instanceof Error)
+    ? value.name + ": " + value.message
+    : value;
+  const original = console.error.bind(console);
+  console.error = (...values) => original(...values.map(describe));
+})()`;
+
 app.whenReady().then(() => {
   window = new BrowserWindow({
     width: 960,
@@ -1654,6 +1691,9 @@ app.whenReady().then(() => {
   logTelegramNetworkFailures(window.webContents.session);
   window.webContents.on("console-message", (details) => {
     if (details.level < 2) return;
+    // A damaged cache entry from an earlier hard stop; Telegram cannot start until it is gone.
+    if (/Failed to read large IndexedDB value/i.test(details.message)
+      && Date.now() - pageLoadStartedAt < pageInitializationTimeoutMs) void reloadWithFreshAppCache();
     log(
       `Telegram renderer console: level=${details.level} line=${details.lineNumber} `
       + `${describeResourceUrl(details.sourceId)} message=${sanitizeConsoleMessage(details.message)}`,
@@ -1661,6 +1701,7 @@ app.whenReady().then(() => {
   });
   window.webContents.on("dom-ready", () => {
     log("Telegram document DOM ready");
+    window.webContents.executeJavaScript(describeConsoleErrorsSource).catch(() => undefined);
   });
   window.webContents.on("did-start-navigation", (_event, url, isInPlace, isMainFrame) => {
     if (!isMainFrame) return;
@@ -1715,6 +1756,18 @@ app.whenReady().then(() => {
 
 app.on("before-quit", () => {
   if (server) server.close();
+});
+
+// Deckygram stops this app with SIGTERM to the main process alone. Quitting through Electron, rather than
+// exiting on the signal, lets Chromium finish writing Telegram's stored chats; a write cut short leaves an
+// entry Telegram cannot read on its next start.
+process.on("SIGTERM", () => {
+  try {
+    window?.webContents.session.flushStorageData();
+  } catch {
+    // The window is already gone; quitting still closes storage cleanly.
+  }
+  app.quit();
 });
 
 app.on("window-all-closed", () => app.quit());

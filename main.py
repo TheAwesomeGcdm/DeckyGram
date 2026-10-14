@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from screenshots import list_screenshots, read_screenshot
 from telegram_web_bridge import TelegramWebBridge, _ssl_contexts, stop_stale_electron_processes
-from updates import check_for_update as check_latest_release
+from updates import check_for_update as check_latest_release, install_release
 
 # Deckygram was called SteamGram; its Telegram login, Electron runtime and settings live under that name.
 LEGACY_PLUGIN_NAME = "SteamGram"
@@ -165,6 +165,22 @@ class Plugin:
         self.update_status = await asyncio.to_thread(check_latest_release, version, _ssl_contexts())
         return self.update_status
 
+    async def install_update(self):
+        """Writes the latest release over Deckygram's own files; the panel then has Decky reload the plugin.
+
+        Returns installed=False with a reason when only Decky's installer can do it.
+        """
+        status = await self.check_for_update()
+        if status["error"]:
+            raise RuntimeError(status["error"])
+        plugin_dir = os.environ.get("DECKY_PLUGIN_DIR", decky.DECKY_PLUGIN_DIR)
+        result = await asyncio.to_thread(install_release, plugin_dir, status, _ssl_contexts())
+        if result["installed"]:
+            decky.logger.info("Installed Deckygram %s in place: %s", result["version"], ", ".join(result["changed"]))
+        else:
+            decky.logger.info("Deckygram update left to Decky's installer: %s", result["reason"])
+        return result
+
     async def _watch_updates(self):
         await asyncio.sleep(UPDATE_FIRST_CHECK_SECONDS)
         while True:
@@ -241,20 +257,19 @@ class Plugin:
         await self.telegram.logout()
 
     async def _main(self):
-        await self.telegram.start()
+        # Telegram can wait for Steam's display at boot, so the watchers start first.
         self.notification_task = asyncio.create_task(self._watch_notifications())
         self.update_task = asyncio.create_task(self._watch_updates())
+        await self.telegram.start()
 
     async def _unload(self):
+        # Decky kills the backend five seconds into _unload, and awaiting these tasks there never finished,
+        # so Telegram Web was left running and later killed mid-write. Telegram is stopped first and nothing
+        # here waits on the tasks.
+        await self.telegram.shut_down()
         for task in (self.notification_task, self.update_task):
-            if not task:
-                continue
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        await self.telegram.stop()
+            if task:
+                task.cancel()
 
     async def _uninstall(self):
         await self._unload()

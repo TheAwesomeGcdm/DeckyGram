@@ -189,21 +189,49 @@ def test_start_stops_stale_electron_and_passes_profile_lock_to_child(tmp_path, m
         bridge._release_profile_lock()
 
 
-def test_terminate_process_group_signals_and_reaps_children(monkeypatch):
+def record_signals(monkeypatch, running_groups=()):
+    """Records kill/killpg calls; signal 0 reports a group as gone unless it is listed as still running."""
+    signals = []
+
+    def kill(pid, received_signal):
+        signals.append(("kill", pid, received_signal))
+
+    def killpg(group, received_signal):
+        if received_signal == 0:
+            if group not in running_groups:
+                raise ProcessLookupError
+            return
+        signals.append(("killpg", group, received_signal))
+
+    monkeypatch.setattr(telegram_web_bridge.os, "kill", kill)
+    monkeypatch.setattr(telegram_web_bridge.os, "killpg", killpg)
+    return signals
+
+
+def test_terminate_process_group_asks_electron_to_quit_before_killing_leftovers(monkeypatch):
     process = MagicMock()
     process.pid = 1234
     process.wait = AsyncMock(return_value=0)
-    signals = []
-    monkeypatch.setattr(
-        telegram_web_bridge.os,
-        "killpg",
-        lambda process_group_id, received_signal: signals.append((process_group_id, received_signal)),
-    )
+    signals = record_signals(monkeypatch)
 
     asyncio.run(telegram_web_bridge.terminate_process_group(process))
 
-    assert signals == [(1234, signal.SIGTERM), (1234, signal.SIGKILL)]
-    process.wait.assert_awaited_once()
+    # SIGTERM goes to the main process only, so Chromium can stop its storage process itself.
+    assert signals == [("kill", 1234, signal.SIGTERM), ("killpg", 1234, signal.SIGKILL)]
+
+
+def test_stop_stale_electron_processes_signals_main_process_then_kills_stuck_groups(monkeypatch):
+    monkeypatch.setattr(telegram_web_bridge, "find_stale_electron_process_groups", lambda browser_dir: {101, 202})
+    monkeypatch.setattr(telegram_web_bridge, "ELECTRON_STOP_TIMEOUT_SECONDS", 0.2)
+    signals = record_signals(monkeypatch, running_groups={202})
+
+    assert telegram_web_bridge.stop_stale_electron_processes("/runtime") == 2
+
+    assert sorted(signals) == [
+        ("kill", 101, signal.SIGTERM),
+        ("kill", 202, signal.SIGTERM),
+        ("killpg", 202, signal.SIGKILL),
+    ]
 
 
 def test_discover_wayland_environment_from_user_runtime_socket(tmp_path):
@@ -556,3 +584,101 @@ def test_video_chunks_and_release_name_the_video(tmp_path):
     bridge._request.assert_awaited_with("POST", "/message-video-chunk", {"id": "abc", "index": 2}, timeout=30)
     asyncio.run(bridge.release_message_video("abc"))
     bridge._request.assert_awaited_with("POST", "/message-video-release", {"id": "abc"})
+
+
+def test_process_running_treats_exited_children_as_stopped(tmp_path):
+    for pid, state in (("10", "S"), ("11", "Z")):
+        (tmp_path / pid).mkdir()
+        (tmp_path / pid / "stat").write_text(f"{pid} (electron (main)) {state} 1 1 1")
+
+    assert telegram_web_bridge._process_running(10, str(tmp_path)) is True
+    assert telegram_web_bridge._process_running(11, str(tmp_path)) is False
+    assert telegram_web_bridge._process_running(12, str(tmp_path)) is False
+
+
+def test_shut_down_asks_electron_to_quit_and_releases_the_profile(tmp_path, monkeypatch):
+    bridge = TelegramWebBridge(str(tmp_path / "plugin"), str(tmp_path / "runtime"), MagicMock())
+    bridge._acquire_profile_lock()
+    process = MagicMock()
+    process.pid = 4321
+    process.wait = AsyncMock(side_effect=AssertionError("must not await the process"))
+    bridge.process = process
+    exits = iter([True, True, False])
+    monkeypatch.setattr(telegram_web_bridge, "_process_running", lambda pid: next(exits))
+    signals = record_signals(monkeypatch)
+
+    asyncio.run(bridge.shut_down())
+
+    assert signals == [("kill", 4321, signal.SIGTERM)]
+    assert bridge.process is None and bridge.profile_lock_file is None
+
+
+def test_shut_down_gives_up_waiting_before_deckys_deadline(tmp_path, monkeypatch):
+    bridge = TelegramWebBridge(str(tmp_path / "plugin"), str(tmp_path / "runtime"), MagicMock())
+    process = MagicMock()
+    process.pid = 4321
+    bridge.process = process
+    monkeypatch.setattr(telegram_web_bridge, "UNLOAD_STOP_SECONDS", 0.3)
+    monkeypatch.setattr(telegram_web_bridge, "_process_running", lambda pid: True)
+    signals = record_signals(monkeypatch)
+
+    asyncio.run(asyncio.wait_for(bridge.shut_down(), timeout=2))
+
+    # Still quitting: it is left to finish rather than killed mid-write.
+    assert signals == [("kill", 4321, signal.SIGTERM)]
+
+
+def bridge_ready_to_launch(tmp_path, monkeypatch, displays):
+    """A bridge whose display discovery returns each of `displays` in turn and whose launch is recorded."""
+    plugin_dir = tmp_path / "plugin"
+    app_dir = plugin_dir / "bin" / "deckygram-telegram-web"
+    app_dir.mkdir(parents=True)
+    (app_dir / "main.cjs").write_text("", encoding="utf-8")
+    bridge = TelegramWebBridge(str(plugin_dir), str(tmp_path / "runtime"), MagicMock())
+    found = iter(displays)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(telegram_web_bridge, "discover_wayland_environment", lambda env: next(found, displays[-1]))
+    monkeypatch.setattr(telegram_web_bridge, "DISPLAY_POLL_SECONDS", 0)
+    monkeypatch.setattr(telegram_web_bridge, "stop_stale_electron_processes", lambda browser_dir: 0)
+    monkeypatch.setattr(telegram_web_bridge, "install_electron", lambda browser_dir: "/electron")
+    launch = AsyncMock(return_value=MagicMock(returncode=None))
+    monkeypatch.setattr(telegram_web_bridge.asyncio, "create_subprocess_exec", launch)
+    monkeypatch.setattr(bridge, "_wait_for_bridge", AsyncMock())
+    return bridge, launch
+
+
+def test_start_waits_for_steams_display_socket_at_boot(tmp_path, monkeypatch):
+    wayland = {"WAYLAND_DISPLAY": "wayland-0", "XDG_RUNTIME_DIR": "/run/user/1000"}
+    bridge, launch = bridge_ready_to_launch(tmp_path, monkeypatch, [None, None, None, wayland])
+
+    asyncio.run(bridge.start())
+    try:
+        assert launch.await_count == 1
+        assert bridge.state["status"] != "error"
+    finally:
+        bridge._release_profile_lock()
+
+
+def test_start_reports_the_missing_display_after_waiting(tmp_path, monkeypatch):
+    bridge, launch = bridge_ready_to_launch(tmp_path, monkeypatch, [None])
+    monkeypatch.setattr(telegram_web_bridge, "DISPLAY_WAIT_SECONDS", 0.05)
+
+    asyncio.run(bridge.start())
+
+    assert launch.await_count == 0
+    assert bridge.state["status"] == "error"
+    assert "Wayland display socket" in bridge.state["error"]
+
+
+def test_a_retry_during_the_wait_does_not_launch_a_second_electron(tmp_path, monkeypatch):
+    wayland = {"WAYLAND_DISPLAY": "wayland-0", "XDG_RUNTIME_DIR": "/run/user/1000"}
+    bridge, launch = bridge_ready_to_launch(tmp_path, monkeypatch, [None, None, None, None, wayland])
+
+    async def boot_and_retry():
+        await asyncio.gather(bridge.start(), bridge.start())
+
+    asyncio.run(boot_and_retry())
+    try:
+        assert launch.await_count == 1
+    finally:
+        bridge._release_profile_lock()

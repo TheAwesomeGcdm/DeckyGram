@@ -1190,7 +1190,7 @@ type MessageResult = {
 
 // Kept equal to package.json by tests; comparing it with the backend's version shows when Steam is
 // still running an older panel after an update.
-const PANEL_VERSION = "0.25.4";
+const PANEL_VERSION = "0.26.0";
 
 const getState = callable<[], TelegramState>("get_state");
 const getVersion = callable<[], string>("get_version");
@@ -1206,13 +1206,47 @@ type UpdateStatus = {
 };
 const getUpdateStatus = callable<[], UpdateStatus | null>("get_update_status");
 const checkForUpdate = callable<[], UpdateStatus>("check_for_update");
+const installUpdateInPlace = callable<[], { installed: boolean; version?: string; reason?: string }>("install_update");
 // Decky's own installer, the one its plugin store uses: it asks the user to confirm, downloads the ZIP,
-// checks it against the release's SHA-256 when GitHub provides one, and reloads the plugin.
+// checks it against the release's SHA-256 when GitHub provides one, and reloads the plugin. Its last step
+// reports the download to Decky's store, which can hang, so it is only the fallback.
 const DECKY_INSTALL_TYPE_UPDATE = 2;
-function installUpdate(status: UpdateStatus) {
+function installWithDecky(status: UpdateStatus) {
   const install = (window as any).DeckyBackend?.callable?.("utilities/install_plugin");
   if (!install) throw new Error("Decky's installer is not available");
   return install(status.download_url, "Deckygram", status.latest, status.sha256 || null, DECKY_INSTALL_TYPE_UPDATE);
+}
+// Enabling a plugin that is already enabled makes Decky stop it and load it afresh from disk; Decky versions
+// without plugin enabling can't do this.
+const canReloadPlugin = () => typeof (window as any).DeckyPluginLoader?.doDisablePlugin === "function";
+const RELOAD_SETTLE_MS = 3000;
+const RELOAD_GIVE_UP_MS = 15000;
+// Decky sometimes reloads Deckygram by itself when its files change. Asking again while that runs loads it
+// twice and strands a backend holding Telegram's profile, so Decky is only asked while the old version runs.
+async function reloadPlugin(version: string) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < RELOAD_GIVE_UP_MS) {
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    // Calls fail while Decky is restarting the backend.
+    const running = await getVersion().catch(() => null);
+    if (running === version) return;
+    if (running !== null && Date.now() - startedAt >= RELOAD_SETTLE_MS) break;
+  }
+  // This panel unmounts during the reload, but this module keeps running until Decky has finished.
+  await (window as any).DeckyBackend.callable("utilities/enable_plugin")("Deckygram");
+}
+// The backend writes the release over Deckygram's files and Decky reloads it, with no installer dialog.
+// onDeckyInstaller runs when Decky's installer has to take over instead.
+async function installUpdate(status: UpdateStatus, onDeckyInstaller: () => void) {
+  if (canReloadPlugin()) {
+    const result = await installUpdateInPlace();
+    if (result.installed && result.version) {
+      await reloadPlugin(result.version);
+      return;
+    }
+  }
+  onDeckyInstaller();
+  await installWithDecky(status);
 }
 const getChats = callable<[], Chat[]>("get_chats");
 const getMessages = callable<[chatId: number], MessageResult>("get_messages");
@@ -1710,9 +1744,9 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
     if (updateState !== "idle") return;
     if (updateStatus?.update_available) {
       setUpdateState("installing");
-      setNotice(t("updateStarted"));
+      setNotice(t("updateInstalling"));
       try {
-        await installUpdate(updateStatus);
+        await installUpdate(updateStatus, () => setNotice(t("updateStarted")));
       } catch (error) {
         setNotice((error as Error).message);
       } finally {

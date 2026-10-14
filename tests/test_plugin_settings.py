@@ -286,3 +286,22 @@ def test_allow_notification_keeps_a_quiet_chat_unlimited(monkeypatch):
 
     # Messages far enough apart each start a fresh burst.
     assert [allow(sent_at, moment, 300, 3) for moment in (0, 400, 800, 1200, 1600)] == [True] * 5
+
+
+def test_unload_stops_telegram_first_and_never_waits_on_its_tasks(monkeypatch):
+    plugin = object.__new__(load_plugin_class(monkeypatch))
+    order = []
+    plugin.telegram = types.SimpleNamespace(shut_down=AsyncMock(side_effect=lambda: order.append("telegram")))
+    plugin.update_task = None
+
+    async def unload_with_stuck_task():
+        # A task that ignores cancellation, like one whose loop Decky's _unload cannot reach.
+        never = asyncio.get_running_loop().create_future()
+        stuck = asyncio.ensure_future(asyncio.shield(never))
+        plugin.notification_task = stuck
+        await asyncio.wait_for(plugin._unload(), timeout=1)
+        order.append("cancelled" if stuck.cancelled() or stuck.cancelling() else "running")
+
+    asyncio.run(unload_with_stuck_task())
+
+    assert order == ["telegram", "cancelled"]
