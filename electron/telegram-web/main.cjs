@@ -236,8 +236,12 @@ const stickerPickerSource = `
     const first = await waitFor(() => stickerButtons()[0], 5000);
     return first ? scrollerOf(first) || first.parentElement : null;
   };
+  // Telegram keeps the closed picker mounted, so only its menu's open class tells whether it is showing.
+  const pickerOpen = () => Array.from(document.querySelectorAll(".SymbolMenu .bubble"))
+    .some((bubble) => bubble.classList.contains("open") && visible(bubble));
   // Telegram only closes the picker for a trusted Escape, which the main process sends afterwards if needed.
   const closeStickerPicker = async () => {
+    if (!pickerOpen()) return;
     closeMenus();
     await sleep(300);
   };
@@ -1481,6 +1485,8 @@ async function handleRequest(request, response) {
         press(sticker);
         // The sticker shows up as a new message once Telegram has taken it.
         const sent = await waitFor(() => (list ? list.querySelectorAll("[data-message-id]").length > before : false), 6000);
+        // Sending closes the picker by itself; an Escape after that would close the chat instead.
+        await waitFor(() => !pickerOpen(), 1000);
         await closeStickerPicker();
         return sent ? "sent" : "not-sent";
       })()`, true);
@@ -1602,10 +1608,11 @@ async function handleRequest(request, response) {
 }
 
 // Telegram's sticker picker ignores synthetic Escape. A trusted one is sent only while the picker is open,
-// since Escape with nothing open would close the chat.
+// since Escape with nothing open would close the chat. The closed picker stays mounted, and its stickers keep
+// their size while it fades out, so only the menu's open class counts.
 async function closeStickerPickerIfOpen() {
-  const open = await window.webContents.executeJavaScript(`Array.from(document.querySelectorAll(".symbol-set[id*='sticker-set'] .StickerButton[data-sticker-id]"))
-    .some((button) => { const rect = button.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; })`);
+  const open = await window.webContents.executeJavaScript(`Array.from(document.querySelectorAll(".SymbolMenu .bubble"))
+    .some((bubble) => { const rect = bubble.getBoundingClientRect(); return bubble.classList.contains("open") && rect.width > 0 && rect.height > 0; })`);
   if (!open) return;
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });

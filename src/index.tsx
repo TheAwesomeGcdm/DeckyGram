@@ -1190,7 +1190,7 @@ type MessageResult = {
 
 // Kept equal to package.json by tests; comparing it with the backend's version shows when Steam is
 // still running an older panel after an update.
-const PANEL_VERSION = "0.25.3";
+const PANEL_VERSION = "0.25.4";
 
 const getState = callable<[], TelegramState>("get_state");
 const getVersion = callable<[], string>("get_version");
@@ -1619,6 +1619,9 @@ type ChatTarget = { title: string; isGroup: boolean };
 // it open on close; one opened from a notification takes over and leaves it on close.
 type WindowTarget = ChatTarget & { sharedWithPanel?: boolean };
 const chatWindowListeners = new Set<(target: ChatTarget) => void>();
+// Decky unmounts the panel whenever the QAM closes, and full-screen views close the QAM, so the panel's open
+// chat is kept here and reopened when the panel comes back. Telegram Web stays in that chat meanwhile.
+let panelChat: ChatTarget | null = null;
 
 type ContentProps = {
   windowChat?: WindowTarget;
@@ -1630,6 +1633,7 @@ type ContentProps = {
 function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
   const [state, setState] = useState(initialState);
   const [selectedChat, setSelectedChat] = useState<Chat | null>(null);
+  const [restoringChat, setRestoringChat] = useState(() => !windowChat && panelChat !== null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [messageRootFound, setMessageRootFound] = useState(true);
   const [messageDiagnostics, setMessageDiagnostics] = useState<MessageResult | null>(null);
@@ -1995,6 +1999,7 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
 
   const openChat = async (chat: Chat) => {
     activeChatId.current = chat.id;
+    if (!windowChat) panelChat = { title: chat.title, isGroup: chat.is_group };
     setSelectedChat(chat);
     setMessages([]);
     setMessageDiagnostics(null);
@@ -2016,6 +2021,7 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
   const closeChat = (leave = true) => {
     const wasOpen = activeChatId.current !== null;
     activeChatId.current = null;
+    if (!windowChat) panelChat = null;
     setSelectedChat(null);
     setMessageAction(null);
     releaseGifs();
@@ -2071,8 +2077,22 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
       setNotice(`${windowChat.title} is no longer in Telegram's chat list.`);
       return;
     }
-    if (!windowChat.sharedWithPanel) chatWindowListeners.forEach((listener) => listener(windowChat));
+    if (!windowChat.sharedWithPanel) {
+      // The panel may be closed and not listening; it must not reopen a chat this window moved Telegram away from.
+      if (panelChat && (panelChat.title !== windowChat.title || panelChat.isGroup !== windowChat.isGroup)) panelChat = null;
+      chatWindowListeners.forEach((listener) => listener(windowChat));
+    }
     void openChat(chat);
+  }, [state]);
+
+  useEffect(() => {
+    // Chat ids are row positions that shift as messages arrive, so the remembered chat is looked up in fresh state.
+    if (!restoringChat || state.status !== "ready") return;
+    setRestoringChat(false);
+    const target = panelChat;
+    const chat = target && state.chats.find((candidate) => candidate.title === target.title && candidate.is_group === target.isGroup);
+    if (chat) void openChat(chat);
+    else panelChat = null;
   }, [state]);
 
   const closeChatWindow = () => {
@@ -2697,7 +2717,7 @@ function Content({ windowChat, closeWindow, closeHandle }: ContentProps = {}) {
               {notice ? <PanelSectionRow>{notice}</PanelSectionRow> : null}
               </div>
             </PanelSection>
-          ) : windowChat ? (
+          ) : windowChat || restoringChat ? (
             <PanelSection>
               <PanelSectionRow>{notice || <SteamSpinner background="transparent" />}</PanelSectionRow>
             </PanelSection>

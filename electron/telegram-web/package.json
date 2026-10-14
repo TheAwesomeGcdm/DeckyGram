@@ -1,6 +1,6 @@
 {
   "name": "deckygram-telegram-web-bridge",
-  "version": "0.25.3",
+  "version": "0.25.4",
   "private": true,
   "main": "main.cjs"
 }
